@@ -8,6 +8,8 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.dynamic_kv_config import DynamicKVConfig
+from vllm.v1.core.dynamic_kv_integration import DynamicKVIntegration
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -104,6 +106,8 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        dynamic_kv_config: DynamicKVConfig | None = None,
+        num_layers: int = 32,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -139,6 +143,18 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        
+        # DynamicKV integration
+        self.dynamic_kv_config = dynamic_kv_config
+        if dynamic_kv_config is not None and dynamic_kv_config.enabled:
+            self.dynamic_kv = DynamicKVIntegration(
+                num_layers=num_layers,
+                max_seq_len=max_model_len,
+                block_size=hash_block_size,
+                config=dynamic_kv_config,
+            )
+        else:
+            self.dynamic_kv = None
 
     @property
     def usage(self) -> float:

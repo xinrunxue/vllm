@@ -16,14 +16,42 @@
 #ifdef __aarch64__
   #include "cpu_attn_neon.hpp"
   // NEON requires head_dim to be a multiple of 32
-  #define NEON_DISPATCH(...)                                                   \
-    case cpu_attention::ISA::NEON: {                                           \
-      using attn_impl = cpu_attention::AttentionImpl<cpu_attention::ISA::NEON, \
-                                                     scalar_t, head_dim>;      \
-      return __VA_ARGS__();                                                    \
+  #define NEON_DISPATCH(...)                                                   
+    case cpu_attention::ISA::NEON: {                                           
+      using attn_impl = cpu_attention::AttentionImpl<cpu_attention::ISA::NEON, 
+                                                     scalar_t, head_dim>;      
+      return __VA_ARGS__();                                                    
     }
+  
+  // Check for SVE support
+  #ifdef ARM_SVE_SUPPORT
+    #include "cpu_attn_sve.hpp"
+    #define SVE_DISPATCH(...)                                                   
+      case cpu_attention::ISA::SVE: {                                           
+        using attn_impl = cpu_attention::AttentionImpl<cpu_attention::ISA::SVE, 
+                                                       scalar_t, head_dim>;      
+        return __VA_ARGS__();                                                    
+      }
+  #else
+    #define SVE_DISPATCH(...) case cpu_attention::ISA::SVE:
+  #endif
+  
+  // Check for SME support
+  #ifdef ARM_SME_SUPPORT
+    #include "cpu_attn_sme.hpp"
+    #define SME_DISPATCH(...)                                                   
+      case cpu_attention::ISA::SME: {                                           
+        using attn_impl = cpu_attention::AttentionImpl<cpu_attention::ISA::SME, 
+                                                       scalar_t, head_dim>;      
+        return __VA_ARGS__();                                                    
+      }
+  #else
+    #define SME_DISPATCH(...) case cpu_attention::ISA::SME:
+  #endif
 #else
   #define NEON_DISPATCH(...) case cpu_attention::ISA::NEON:
+  #define SVE_DISPATCH(...) case cpu_attention::ISA::SVE:
+  #define SME_DISPATCH(...) case cpu_attention::ISA::SME:
 #endif  // #ifdef __aarch64__
 
 #define CPU_ATTN_DISPATCH_CASE(HEAD_DIM, ...) \
@@ -57,6 +85,8 @@
     switch (ISA_TYPE) {                                                       \
       AMX_DISPATCH(__VA_ARGS__)                                               \
       NEON_DISPATCH(__VA_ARGS__)                                              \
+      SVE_DISPATCH(__VA_ARGS__)                                               \
+      SME_DISPATCH(__VA_ARGS__)                                               \
       case cpu_attention::ISA::VEC: {                                         \
         using attn_impl =                                                     \
             cpu_attention::AttentionImpl<cpu_attention::ISA::VEC, scalar_t,   \
@@ -177,6 +207,10 @@ void cpu_attn_reshape_and_cache(
       return cpu_attention::ISA::VEC16;
     } else if (isa == "neon") {
       return cpu_attention::ISA::NEON;
+    } else if (isa == "sve") {
+      return cpu_attention::ISA::SVE;
+    } else if (isa == "sme") {
+      return cpu_attention::ISA::SME;
     } else {
       TORCH_CHECK(false, "Invalid ISA type: " + isa);
     }

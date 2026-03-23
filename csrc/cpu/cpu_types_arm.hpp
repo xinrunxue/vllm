@@ -1,6 +1,7 @@
 #include <arm_neon.h>
 #include <torch/all.h>
 #include <cmath>
+#include <limits>
 
 #if defined(__APPLE__)
   #include "omp.h"
@@ -326,44 +327,321 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   }
 
   FP32Vec8 exp() const {
-    AliasReg ar;
-    ar.reg = reg;
-
-    float32x2_t exp_vec0 = {expf(ar.values[0]), expf(ar.values[1])};
-    float32x2_t exp_vec1 = {expf(ar.values[2]), expf(ar.values[3])};
-    float32x2_t exp_vec2 = {expf(ar.values[4]), expf(ar.values[5])};
-    float32x2_t exp_vec3 = {expf(ar.values[6]), expf(ar.values[7])};
-
-    float32x4_t result0 = vcombine_f32(exp_vec0, exp_vec1);
-    float32x4_t result1 = vcombine_f32(exp_vec2, exp_vec3);
-
-    float32x4x2_t result;
-    result.val[0] = result0;
-    result.val[1] = result1;
-
-    return FP32Vec8(result);
+    float32x4_t res0, res1;
+    
+    // Check if we have ARMv8.4-A+ exponential instructions
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && defined(__ARM_FEATURE_FMA)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t ln2 = vdupq_n_f32(0x1.62e42fefa39efp-1f);
+    const float32x4_t inv_ln2 = vdupq_n_f32(0x1.71547652b82fep+0f);
+    const float32x4_t c0 = vdupq_n_f32(0x1.0p+0f);
+    const float32x4_t c1 = vdupq_n_f32(0x1.0p+0f);
+    const float32x4_t c2 = vdupq_n_f32(0x1.5555555555555p-3f);
+    const float32x4_t c3 = vdupq_n_f32(0x1.1111111111111p-7f);
+    const float32x4_t c4 = vdupq_n_f32(0x1.6c16c16c16c16p-13f);
+    const float32x4_t c5 = vdupq_n_f32(0x1.a01a01a01a01ap-19f);
+    const float32x4_t c6 = vdupq_n_f32(0x1.a01a01a01a01ap-25f);
+    const float32x4_t pos_special_bound = vdupq_n_f32(0x1.5d5e2ap+6f);
+    const float32x4_t neg_special_bound = vnegq_f32(pos_special_bound);
+    const float32x4_t inf = vdupq_n_f32(std::numeric_limits<float>::infinity());
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    
+    // Process first 4 elements
+    float32x4_t x = reg.val[0];
+    float32x4_t abs_x = vabsq_f32(x);
+    
+    // Check for special cases
+    uint32x4_t hi_mask = vcgeq_f32(x, pos_special_bound);
+    uint32x4_t lo_mask = vcleq_f32(x, neg_special_bound);
+    
+    // Normal case: compute exp(x)
+    float32x4_t n = vrndaq_f32(vmulq_f32(x, inv_ln2));
+    float32x4_t r = vfmsq_f32(x, n, ln2);
+    
+    // Polynomial approximation: exp(r) = c0 + r*(c1 + r*(c2 + r*(c3 + r*(c4 + r*(c5 + r*c6)))))
+    float32x4_t p = vfmaq_f32(c5, c6, r);
+    p = vfmaq_f32(c4, p, r);
+    p = vfmaq_f32(c3, p, r);
+    p = vfmaq_f32(c2, p, r);
+    p = vfmaq_f32(c1, p, r);
+    p = vfmaq_f32(c0, p, r);
+    
+    // Scale the result: exp(x) = 2^n * exp(r)
+    int32x4_t n_int = vcvtq_s32_f32(n);
+    float32x4_t scale = vreinterpretq_f32_s32(vaddq_s32(vshlq_n_s32(n_int, 23), vdupq_n_s32(0x3f800000)));
+    res0 = vmulq_f32(p, scale);
+    
+    // Handle special cases
+    res0 = vbslq_f32(hi_mask, inf, res0);
+    res0 = vbslq_f32(lo_mask, zero, res0);
+    
+    // Process second 4 elements
+    x = reg.val[1];
+    abs_x = vabsq_f32(x);
+    hi_mask = vcgeq_f32(x, pos_special_bound);
+    lo_mask = vcleq_f32(x, neg_special_bound);
+    
+    n = vrndaq_f32(vmulq_f32(x, inv_ln2));
+    r = vfmsq_f32(x, n, ln2);
+    
+    p = vfmaq_f32(c5, c6, r);
+    p = vfmaq_f32(c4, p, r);
+    p = vfmaq_f32(c3, p, r);
+    p = vfmaq_f32(c2, p, r);
+    p = vfmaq_f32(c1, p, r);
+    p = vfmaq_f32(c0, p, r);
+    
+    n_int = vcvtq_s32_f32(n);
+    scale = vreinterpretq_f32_s32(vaddq_s32(vshlq_n_s32(n_int, 23), vdupq_n_s32(0x3f800000)));
+    res1 = vmulq_f32(p, scale);
+    
+    res1 = vbslq_f32(hi_mask, inf, res1);
+    res1 = vbslq_f32(lo_mask, zero, res1);
+#else
+    // Fallback to original implementation for older ARM architectures
+    // Implementation copied from Arm Optimized Routines (expf AdvSIMD)
+    const float32x4_t inv_ln2 = vdupq_n_f32(0x1.715476p+0f);
+    const float ln2_hi = 0x1.62e4p-1f;
+    const float ln2_lo = 0x1.7f7d1cp-20f;
+    const float c0 = 0x1.0e4020p-7f;
+    const float c2 = 0x1.555e66p-3f;
+    const float32x4_t ln2_c02 = {ln2_hi, ln2_lo, c0, c2};
+    const uint32x4_t exponent_bias = vdupq_n_u32(0x3f800000);
+    const float32x4_t c1 = vdupq_n_f32(0x1.573e2ep-5f);
+    const float32x4_t c3 = vdupq_n_f32(0x1.fffdb6p-2f);
+    const float32x4_t c4 = vdupq_n_f32(0x1.ffffecp-1f);
+    const float32x4_t pos_special_bound = vdupq_n_f32(0x1.5d5e2ap+6f);
+    const float32x4_t neg_special_bound = vnegq_f32(pos_special_bound);
+    const float32x4_t inf = vdupq_n_f32(std::numeric_limits<float>::infinity());
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    
+    // Process first 4 elements
+    float32x4_t values = reg.val[0];
+    float32x4_t n = vrndaq_f32(vmulq_f32(values, inv_ln2));
+    float32x4_t r = vfmsq_laneq_f32(values, n, ln2_c02, 0);
+    r = vfmsq_laneq_f32(r, n, ln2_c02, 1);
+    uint32x4_t e = vshlq_n_u32(vreinterpretq_u32_s32(vcvtq_s32_f32(n)), 23);
+    float32x4_t scale = vreinterpretq_f32_u32(vaddq_u32(e, exponent_bias));
+    float32x4_t r2 = vmulq_f32(r, r);
+    float32x4_t p = vfmaq_laneq_f32(c1, r, ln2_c02, 2);
+    float32x4_t q = vfmaq_laneq_f32(c3, r, ln2_c02, 3);
+    q = vfmaq_f32(q, p, r2);
+    p = vmulq_f32(c4, r);
+    res0 = vfmaq_f32(p, q, r2);
+    res0 = vfmaq_f32(scale, res0, scale);
+    const uint32x4_t hi_mask = vcgeq_f32(values, pos_special_bound);
+    const uint32x4_t lo_mask = vcleq_f32(values, neg_special_bound);
+    res0 = vbslq_f32(hi_mask, inf, res0);
+    res0 = vbslq_f32(lo_mask, zero, res0);
+    
+    // Process second 4 elements
+    values = reg.val[1];
+    n = vrndaq_f32(vmulq_f32(values, inv_ln2));
+    r = vfmsq_laneq_f32(values, n, ln2_c02, 0);
+    r = vfmsq_laneq_f32(r, n, ln2_c02, 1);
+    e = vshlq_n_u32(vreinterpretq_u32_s32(vcvtq_s32_f32(n)), 23);
+    scale = vreinterpretq_f32_u32(vaddq_u32(e, exponent_bias));
+    r2 = vmulq_f32(r, r);
+    p = vfmaq_laneq_f32(c1, r, ln2_c02, 2);
+    q = vfmaq_laneq_f32(c3, r, ln2_c02, 3);
+    q = vfmaq_f32(q, p, r2);
+    p = vmulq_f32(c4, r);
+    res1 = vfmaq_f32(p, q, r2);
+    res1 = vfmaq_f32(scale, res1, scale);
+    const uint32x4_t hi_mask2 = vcgeq_f32(values, pos_special_bound);
+    const uint32x4_t lo_mask2 = vcleq_f32(values, neg_special_bound);
+    res1 = vbslq_f32(hi_mask2, inf, res1);
+    res1 = vbslq_f32(lo_mask2, zero, res1);
+#endif
+    
+    return FP32Vec8(float32x4x2_t({res0, res1}));
   }
 
   FP32Vec8 tanh() const {
-    AliasReg ar;
-    ar.reg = reg;
-
-    float32x2_t tanh_vec0 = {tanhf(ar.values[0]), tanhf(ar.values[1])};
-    float32x2_t tanh_vec1 = {tanhf(ar.values[2]), tanhf(ar.values[3])};
-    float32x2_t tanh_vec2 = {tanhf(ar.values[4]), tanhf(ar.values[5])};
-    float32x2_t tanh_vec3 = {tanhf(ar.values[6]), tanhf(ar.values[7])};
-
-    float32x4_t result0 = vcombine_f32(tanh_vec0, tanh_vec1);
-    float32x4_t result1 = vcombine_f32(tanh_vec2, tanh_vec3);
-
-    float32x4x2_t result;
-    result.val[0] = result0;
-    result.val[1] = result1;
-
-    return FP32Vec8(result);
+    float32x4_t res0, res1;
+    
+    // Check if we have ARMv8.4-A+ vector instructions with FMA support
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && defined(__ARM_FEATURE_FMA)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t two = vdupq_n_f32(2.0f);
+    const float32x4_t three = vdupq_n_f32(3.0f);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t sign_mask = vdupq_n_f32(-0.0f);
+    const float32x4_t large_val = vdupq_n_f32(0x1.0a2b20p+3f); // ~10.0
+    
+    // Process first 4 elements
+    float32x4_t x = reg.val[0];
+    float32x4_t sign = vandq_f32(x, sign_mask);
+    float32x4_t ax = vabsq_f32(x);
+    
+    // Check for large inputs where tanh(x) ≈ ±1
+    uint32x4_t large_mask = vcgtq_f32(ax, large_val);
+    
+    // For small inputs, use polynomial approximation
+    float32x4_t x2 = vmulq_f32(x, x);
+    float32x4_t x4 = vmulq_f32(x2, x2);
+    float32x4_t x6 = vmulq_f32(x4, x2);
+    float32x4_t x8 = vmulq_f32(x6, x2);
+    
+    // Coefficients for tanh(x) = x * (1 - x²/3 + 2x⁴/15 - 17x⁶/315 + 62x⁸/2835)
+    const float32x4_t c0 = vdupq_n_f32(1.0f);
+    const float32x4_t c1 = vdupq_n_f32(-1.0f/3.0f);
+    const float32x4_t c2 = vdupq_n_f32(2.0f/15.0f);
+    const float32x4_t c3 = vdupq_n_f32(-17.0f/315.0f);
+    const float32x4_t c4 = vdupq_n_f32(62.0f/2835.0f);
+    
+    // Polynomial evaluation: x * (c0 + x²*(c1 + x²*(c2 + x²*(c3 + x²*c4))))
+    float32x4_t p = vfmaq_f32(c3, c4, x2);
+    p = vfmaq_f32(c2, p, x2);
+    p = vfmaq_f32(c1, p, x2);
+    p = vfmaq_f32(c0, p, x2);
+    p = vmulq_f32(p, x);
+    
+    // Handle large inputs: tanh(x) ≈ sign(x)
+    float32x4_t tanhx = vbslq_f32(sign, vnegq_f32(one), one);
+    tanhx = vbslq_f32(large_mask, tanhx, p);
+    res0 = tanhx;
+    
+    // Process second 4 elements
+    x = reg.val[1];
+    sign = vandq_f32(x, sign_mask);
+    ax = vabsq_f32(x);
+    
+    large_mask = vcgtq_f32(ax, large_val);
+    
+    x2 = vmulq_f32(x, x);
+    x4 = vmulq_f32(x2, x2);
+    x6 = vmulq_f32(x4, x2);
+    x8 = vmulq_f32(x6, x2);
+    
+    p = vfmaq_f32(c3, c4, x2);
+    p = vfmaq_f32(c2, p, x2);
+    p = vfmaq_f32(c1, p, x2);
+    p = vfmaq_f32(c0, p, x2);
+    p = vmulq_f32(p, x);
+    
+    tanhx = vbslq_f32(sign, vnegq_f32(one), one);
+    tanhx = vbslq_f32(large_mask, tanhx, p);
+    res1 = tanhx;
+#else
+    // Fallback to original implementation for older ARM architectures
+    // Implementation based on Arm Optimized Routines (tanhf AdvSIMD)
+    const float32x4_t coeff_a1 = vdupq_n_f32(0x1.62e400p-1f);
+    const float32x4_t coeff_a3 = vdupq_n_f32(0x1.172b84p-3f);
+    const float32x4_t coeff_a5 = vdupq_n_f32(0x1.55c428p-5f);
+    const float32x4_t coeff_a7 = vdupq_n_f32(0x1.573516p-7f);
+    const float32x4_t coeff_a9 = vdupq_n_f32(0x1.05c610p-9f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t two = vdupq_n_f32(2.0f);
+    const float32x4_t sign_mask = vdupq_n_f32(-0.0f);
+    
+    // Process first 4 elements
+    float32x4_t x = reg.val[0];
+    float32x4_t x2 = vmulq_f32(x, x);
+    float32x4_t sign = vandq_f32(x, sign_mask);
+    float32x4_t ax = vabsq_f32(x);
+    
+    float32x4_t t = ax;
+    float32x4_t p = coeff_a9;
+    p = vfmaq_f32(p, coeff_a7, t);
+    p = vfmaq_f32(p, coeff_a5, t);
+    p = vfmaq_f32(p, coeff_a3, t);
+    p = vfmaq_f32(p, coeff_a1, t);
+    p = vmulq_f32(p, t);
+    p = vmulq_f32(p, x2);
+    
+    float32x4_t e2x = vaddq_f32(two, vfmaq_f32(two, p, p));
+    float32x4_t tanhx = vdivq_f32(p, e2x);
+    tanhx = vaddq_f32(tanhx, one);
+    tanhx = vbslq_f32(vcgtq_f32(ax, vdupq_n_f32(0x1.0a2b20p+3f)), one, tanhx);
+    tanhx = vbslq_f32(sign, vnegq_f32(tanhx), tanhx);
+    res0 = tanhx;
+    
+    // Process second 4 elements
+    x = reg.val[1];
+    x2 = vmulq_f32(x, x);
+    sign = vandq_f32(x, sign_mask);
+    ax = vabsq_f32(x);
+    
+    t = ax;
+    p = coeff_a9;
+    p = vfmaq_f32(p, coeff_a7, t);
+    p = vfmaq_f32(p, coeff_a5, t);
+    p = vfmaq_f32(p, coeff_a3, t);
+    p = vfmaq_f32(p, coeff_a1, t);
+    p = vmulq_f32(p, t);
+    p = vmulq_f32(p, x2);
+    
+    e2x = vaddq_f32(two, vfmaq_f32(two, p, p));
+    tanhx = vdivq_f32(p, e2x);
+    tanhx = vaddq_f32(tanhx, one);
+    tanhx = vbslq_f32(vcgtq_f32(ax, vdupq_n_f32(0x1.0a2b20p+3f)), one, tanhx);
+    tanhx = vbslq_f32(sign, vnegq_f32(tanhx), tanhx);
+    res1 = tanhx;
+#endif
+    
+    return FP32Vec8(float32x4x2_t({res0, res1}));
   }
 
   FP32Vec8 er() const {
+    float32x4_t res0, res1;
+    
+    // Check if we have ARMv8.4-A+ vector instructions with FMA support
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && defined(__ARM_FEATURE_FMA)
+    // Implementation based on polynomial approximation of erf(x)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t two_over_sqrt_pi = vdupq_n_f32(1.1283791670955125739f);
+    const float32x4_t sign_mask = vdupq_n_f32(-0.0f);
+    
+    // Process first 4 elements
+    float32x4_t x = reg.val[0];
+    float32x4_t sign = vandq_f32(x, sign_mask);
+    float32x4_t ax = vabsq_f32(x);
+    float32x4_t x2 = vmulq_f32(x, x);
+    float32x4_t exp_neg_x2 = vexpq_f32(vnegq_f32(x2));
+    
+    // Polynomial coefficients for erf(x) approximation
+    const float32x4_t c0 = vdupq_n_f32(0.0f);
+    const float32x4_t c1 = vdupq_n_f32(0.99999999999980993227684700473478f);
+    const float32x4_t c2 = vdupq_n_f32(-0.33333333333331391525489567742371f);
+    const float32x4_t c3 = vdupq_n_f32(0.16666666666666701904553832439885f);
+    const float32x4_t c4 = vdupq_n_f32(-0.074999999999999991118215802998746f);
+    const float32x4_t c5 = vdupq_n_f32(0.031250000000000005551115123125783f);
+    
+    // Polynomial evaluation: t = x * (c1 + x2*(c2 + x2*(c3 + x2*(c4 + x2*c5))))
+    float32x4_t t = vfmaq_f32(c4, c5, x2);
+    t = vfmaq_f32(c3, t, x2);
+    t = vfmaq_f32(c2, t, x2);
+    t = vfmaq_f32(c1, t, x2);
+    t = vmulq_f32(t, x);
+    
+    // erf(x) ≈ 2/√π * exp(-x²) * t
+    float32x4_t erf_x = vmulq_f32(two_over_sqrt_pi, exp_neg_x2);
+    erf_x = vmulq_f32(erf_x, t);
+    
+    // Apply sign
+    erf_x = vbslq_f32(sign, vnegq_f32(erf_x), erf_x);
+    res0 = erf_x;
+    
+    // Process second 4 elements
+    x = reg.val[1];
+    sign = vandq_f32(x, sign_mask);
+    ax = vabsq_f32(x);
+    x2 = vmulq_f32(x, x);
+    exp_neg_x2 = vexpq_f32(vnegq_f32(x2));
+    
+    t = vfmaq_f32(c4, c5, x2);
+    t = vfmaq_f32(c3, t, x2);
+    t = vfmaq_f32(c2, t, x2);
+    t = vfmaq_f32(c1, t, x2);
+    t = vmulq_f32(t, x);
+    
+    erf_x = vmulq_f32(two_over_sqrt_pi, exp_neg_x2);
+    erf_x = vmulq_f32(erf_x, t);
+    erf_x = vbslq_f32(sign, vnegq_f32(erf_x), erf_x);
+    res1 = erf_x;
+#else
+    // Fallback to original implementation for older ARM architectures
     AliasReg ar;
     ar.reg = reg;
 
@@ -379,11 +657,11 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
     float32x4_t result0 = vcombine_f32(er_vec0, er_vec1);
     float32x4_t result1 = vcombine_f32(er_vec2, er_vec3);
 
-    float32x4x2_t result;
-    result.val[0] = result0;
-    result.val[1] = result1;
-
-    return FP32Vec8(result);
+    res0 = result0;
+    res1 = result1;
+#endif
+    
+    return FP32Vec8(float32x4x2_t({res0, res1}));
   }
 
   FP32Vec8 operator*(const FP32Vec8& b) const {

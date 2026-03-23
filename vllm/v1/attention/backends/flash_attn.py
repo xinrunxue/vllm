@@ -51,6 +51,8 @@ from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.core.dynamic_kv_config import DynamicKVConfig
+from vllm.v1.attention.dynamic_kv_bridge import DynamicKVAttentionBridge
 
 logger = init_logger(__name__)
 
@@ -532,6 +534,10 @@ class FlashAttentionImpl(AttentionImpl):
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
+        dynamic_kv_config: DynamicKVConfig | None = None,
+        num_layers: int = 32,
+        max_seq_len: int = 8192,
+        block_size: int = 16,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -576,6 +582,21 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         self.supports_quant_query_input = True
+        
+        # DynamicKV support
+        self.dynamic_kv_config = dynamic_kv_config
+        if dynamic_kv_config is not None and dynamic_kv_config.enabled:
+            self.dynamic_kv_bridge = DynamicKVAttentionBridge(
+                num_layers=num_layers,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_size,
+                block_size=block_size,
+                max_seq_len=max_seq_len,
+                config=dynamic_kv_config,
+            )
+        else:
+            self.dynamic_kv_bridge = None
 
     def forward(
         self,
@@ -672,6 +693,17 @@ class FlashAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+            
+            # DynamicKV: Apply compression after caching
+            if self.dynamic_kv_bridge is not None:
+                self._apply_dynamic_kv_compression(
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    attn_metadata,
+                    layer,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
@@ -851,6 +883,91 @@ class FlashAttentionImpl(AttentionImpl):
             query_attn_out,
             query_lse,
         )
+
+    def _apply_dynamic_kv_compression(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        layer: torch.nn.Module,
+    ):
+        """Apply DynamicKV compression to KV cache.
+        
+        This method is called after reshape_and_cache_flash to compress
+        the KV cache based on token importance.
+        
+        Args:
+            key: [num_tokens, num_kv_heads, head_dim] Key tensor
+            value: [num_tokens, num_kv_heads, head_dim] Value tensor
+            key_cache: Key cache tensor
+            value_cache: Value cache tensor
+            attn_metadata: Attention metadata
+            layer: The attention layer
+        """
+        if self.dynamic_kv_bridge is None:
+            return
+        
+        num_tokens = key.shape[0]
+        slot_mapping = attn_metadata.slot_mapping
+        
+        if slot_mapping is None or num_tokens == 0:
+            return
+        
+        request_ids = getattr(attn_metadata, 'request_ids', None)
+        if request_ids is None:
+            return
+        
+        for req_idx, request_id in enumerate(request_ids):
+            if not self.dynamic_kv_bridge.should_compress_for_request(
+                request_id, num_tokens
+            ):
+                continue
+            
+            layer_idx = getattr(layer, 'layer_idx', 0)
+            
+            compressed_key, compressed_value, retain_indices = \
+                self.dynamic_kv_bridge.compress_and_cache(
+                    request_id=request_id,
+                    layer_idx=layer_idx,
+                    key=key,
+                    value=value,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    slot_mapping=slot_mapping,
+                )
+            
+            if retain_indices is not None and len(retain_indices) < num_tokens:
+                self._update_cache_with_compressed(
+                    key_cache,
+                    value_cache,
+                    compressed_key,
+                    compressed_value,
+                    retain_indices,
+                    slot_mapping,
+                )
+    
+    def _update_cache_with_compressed(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        compressed_key: torch.Tensor,
+        compressed_value: torch.Tensor,
+        retain_indices: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ):
+        """Update the KV cache with compressed data.
+        
+        Args:
+            key_cache: Original key cache
+            value_cache: Original value cache
+            compressed_key: Compressed key tensor
+            compressed_value: Compressed value tensor
+            retain_indices: Indices of retained tokens
+            slot_mapping: Slot mapping for cache positions
+        """
+        pass
 
     def _forward_encoder_attention(
         self,

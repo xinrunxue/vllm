@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "cuda_utils.h"
+#include "dynamic_kv.h"
 #include "ops.h"
 #include "core/registration.h"
 
@@ -795,6 +796,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "dst_scale, Tensor block_table, Tensor cu_seq_lens) -> ()");
   cache_ops.impl("cp_gather_indexer_k_quant_cache", torch::kCUDA,
                  &cp_gather_indexer_k_quant_cache);
+
+  // DynamicKV operations for adaptive KV cache compression
+  cache_ops.def(
+      "compute_token_importance(Tensor key, Tensor value, "
+      "Tensor! importance, int num_heads, int head_size) -> ()");
+  cache_ops.impl("compute_token_importance", torch::kCUDA,
+                 &compute_token_importance);
+
+  cache_ops.def(
+      "compress_kv_cache(Tensor src_key, Tensor src_value, "
+      "Tensor! dst_key, Tensor! dst_value, "
+      "Tensor retain_indices, int num_retained, "
+      "int num_heads, int head_size) -> ()");
+  cache_ops.impl("compress_kv_cache", torch::kCUDA, &compress_kv_cache);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
