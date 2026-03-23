@@ -54,6 +54,194 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+_ATTENTION_ANALYSIS_ENABLED = False
+_ATTENTION_ANALYSIS_THRESHOLD = 1e-4
+_ATTENTION_LAYER_COUNTER: dict[str, int] = {}
+_ATTENTION_LAYER_STATS: dict[str, list] = {}
+
+
+def enable_attention_analysis(threshold: float = 1e-4):
+    global _ATTENTION_ANALYSIS_ENABLED, _ATTENTION_ANALYSIS_THRESHOLD
+    _ATTENTION_ANALYSIS_ENABLED = True
+    _ATTENTION_ANALYSIS_THRESHOLD = threshold
+    print(f"[AttentionAnalysis] 已启用注意力分析，阈值: {threshold}")
+
+
+def disable_attention_analysis():
+    global _ATTENTION_ANALYSIS_ENABLED
+    _ATTENTION_ANALYSIS_ENABLED = False
+
+
+def is_attention_analysis_enabled() -> bool:
+    return _ATTENTION_ANALYSIS_ENABLED
+
+
+def analyze_attention_for_layer(
+    layer_name: str,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    causal: bool = True,
+) -> dict:
+    """分析单层注意力权重分布
+    
+    Args:
+        layer_name: 层名称
+        query: [num_tokens, num_heads, head_dim]
+        key: [num_tokens, num_kv_heads, head_dim]
+        num_kv_heads: KV头数
+        scale: 缩放因子
+        causal: 是否因果注意力
+        
+    Returns:
+        统计信息字典
+    """
+    if not _ATTENTION_ANALYSIS_ENABLED:
+        return {}
+    
+    import torch.nn.functional as F
+    
+    if layer_name not in _ATTENTION_LAYER_COUNTER:
+        _ATTENTION_LAYER_COUNTER[layer_name] = 0
+        _ATTENTION_LAYER_STATS[layer_name] = []
+    _ATTENTION_LAYER_COUNTER[layer_name] += 1
+    
+    with torch.no_grad():
+        num_tokens = query.shape[0]
+        num_heads = query.shape[1]
+        head_dim = query.shape[2]
+        
+        query_t = query.transpose(0, 1).float()
+        key_t = key.transpose(0, 1).float()
+        
+        num_groups = num_heads // num_kv_heads
+        if num_groups > 1:
+            key_t = key_t.unsqueeze(1).expand(-1, num_groups, -1, -1)
+            key_t = key_t.reshape(num_heads, num_tokens, head_dim)
+        
+        attn_weights = torch.matmul(query_t, key_t.transpose(-2, -1)) * scale
+        
+        if causal and num_tokens > 1:
+            causal_mask = torch.triu(
+                torch.ones(num_tokens, num_tokens, device=attn_weights.device),
+                diagonal=1
+            ).bool()
+            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+        
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        
+        total_elements = attn_weights.numel()
+        near_zero_mask = attn_weights < _ATTENTION_ANALYSIS_THRESHOLD
+        near_zero_count = near_zero_mask.sum().item()
+        near_zero_ratio = near_zero_count / total_elements if total_elements > 0 else 0.0
+        
+        head_near_zero_ratios = []
+        for h in range(num_heads):
+            head_weights = attn_weights[h]
+            head_near_zero = (head_weights < _ATTENTION_ANALYSIS_THRESHOLD).sum().item()
+            head_total = head_weights.numel()
+            head_near_zero_ratios.append(head_near_zero / head_total)
+        
+        valid_weights = attn_weights[attn_weights > 0]
+        entropy = 0.0
+        if valid_weights.numel() > 0:
+            entropy = -torch.sum(valid_weights * torch.log(valid_weights + 1e-10)).item() / num_heads
+        
+        stats = {
+            "layer_name": layer_name,
+            "num_tokens": num_tokens,
+            "num_heads": num_heads,
+            "total_elements": total_elements,
+            "near_zero_count": near_zero_count,
+            "near_zero_ratio": near_zero_ratio,
+            "head_near_zero_ratios": head_near_zero_ratios,
+            "entropy": entropy,
+            "max_weight": attn_weights.max().item(),
+            "mean_weight": attn_weights.mean().item(),
+        }
+        
+        _ATTENTION_LAYER_STATS[layer_name].append(stats)
+        
+        print(f"\n[AttentionAnalysis] {layer_name}:")
+        print(f"  Tokens: {num_tokens}, Heads: {num_heads}")
+        print(f"  接近零 (<{_ATTENTION_ANALYSIS_THRESHOLD}) 比例: {near_zero_ratio:.2%}")
+        print(f"  接近零元素数: {near_zero_count:,} / {total_elements:,}")
+        print(f"  权重范围: [{attn_weights[attn_weights > 0].min().item() if (attn_weights > 0).any() else 0:.6f}, {stats['max_weight']:.6f}]")
+        print(f"  权重均值: {stats['mean_weight']:.6f}")
+        print(f"  注意力熵: {entropy:.4f}")
+        print(f"  各头接近零比例: min={min(head_near_zero_ratios):.2%}, max={max(head_near_zero_ratios):.2%}")
+        
+        return stats
+
+
+def get_attention_analysis_summary() -> dict:
+    """获取注意力分析摘要"""
+    if not _ATTENTION_LAYER_STATS:
+        return {"message": "没有收集到统计数据"}
+    
+    layer_summaries = {}
+    for layer_name, stats_list in _ATTENTION_LAYER_STATS.items():
+        if stats_list:
+            ratios = [s["near_zero_ratio"] for s in stats_list]
+            entropies = [s["entropy"] for s in stats_list]
+            layer_summaries[layer_name] = {
+                "sample_count": len(stats_list),
+                "avg_near_zero_ratio": float(np.mean(ratios)),
+                "max_near_zero_ratio": float(max(ratios)),
+                "min_near_zero_ratio": float(min(ratios)),
+                "avg_entropy": float(np.mean(entropies)),
+            }
+    
+    all_ratios = []
+    for stats_list in _ATTENTION_LAYER_STATS.values():
+        all_ratios.extend([s["near_zero_ratio"] for s in stats_list])
+    
+    return {
+        "total_samples": sum(len(v) for v in _ATTENTION_LAYER_STATS.values()),
+        "overall_avg_near_zero_ratio": float(np.mean(all_ratios)) if all_ratios else 0.0,
+        "overall_max_near_zero_ratio": float(max(all_ratios)) if all_ratios else 0.0,
+        "overall_min_near_zero_ratio": float(min(all_ratios)) if all_ratios else 0.0,
+        "layer_summaries": layer_summaries,
+        "compression_potential": {
+            "layers_with_50p_sparsity": sum(
+                1 for s in layer_summaries.values() if s["avg_near_zero_ratio"] > 0.5
+            ),
+            "layers_with_30p_sparsity": sum(
+                1 for s in layer_summaries.values() if s["avg_near_zero_ratio"] > 0.3
+            ),
+            "estimated_avg_compression": float(np.mean(all_ratios)) if all_ratios else 0.0,
+        }
+    }
+
+
+def print_attention_analysis_summary():
+    """打印注意力分析摘要"""
+    summary = get_attention_analysis_summary()
+    
+    print(f"\n{'='*80}")
+    print("[AttentionAnalysis] 最终统计摘要")
+    print(f"{'='*80}")
+    print(f"总采样次数: {summary.get('total_samples', 0)}")
+    print(f"整体平均接近零比例: {summary.get('overall_avg_near_zero_ratio', 0):.2%}")
+    print(f"整体最大接近零比例: {summary.get('overall_max_near_zero_ratio', 0):.2%}")
+    print(f"整体最小接近零比例: {summary.get('overall_min_near_zero_ratio', 0):.2%}")
+    
+    print(f"\n压缩潜力分析:")
+    cp = summary.get("compression_potential", {})
+    print(f"  高稀疏层 (>50%): {cp.get('layers_with_50p_sparsity', 0)}")
+    print(f"  中等稀疏层 (>30%): {cp.get('layers_with_30p_sparsity', 0)}")
+    print(f"  预计平均压缩率: {cp.get('estimated_avg_compression', 0):.2%}")
+    
+    print(f"\n各层统计:")
+    layer_summaries = summary.get("layer_summaries", {})
+    for layer_name in sorted(layer_summaries.keys()):
+        s = layer_summaries[layer_name]
+        print(f"  {layer_name}: 接近零={s['avg_near_zero_ratio']:.2%}, "
+              f"熵={s['avg_entropy']:.4f}, 样本数={s['sample_count']}")
+    
+    print(f"{'='*80}")
+
 
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -630,6 +818,18 @@ class FlashAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # Attention analysis for DynamicKV
+        if _ATTENTION_ANALYSIS_ENABLED and key is not None:
+            layer_name = getattr(layer, 'layer_name', f'layer_{id(layer)}')
+            analyze_attention_for_layer(
+                layer_name=layer_name,
+                query=query[:num_actual_tokens],
+                key=key[:num_actual_tokens],
+                num_kv_heads=self.num_kv_heads,
+                scale=self.scale,
+                causal=attn_metadata.causal,
+            )
 
         # Handle encoder attention differently - no KV cache needed
         if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
