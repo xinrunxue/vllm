@@ -202,7 +202,10 @@ def analyze_attention_for_layer(
                 
                 valid_weights = attn_weights[attn_weights > 0]
                 if valid_weights.numel() > 0:
-                    head_entropy = -torch.sum(valid_weights * torch.log(valid_weights + 1e-10)).item()
+                    per_query_entropy = -torch.sum(
+                        attn_weights * torch.log(attn_weights + 1e-10), dim=-1
+                    )
+                    head_entropy = per_query_entropy.mean().item()
                     total_entropy += head_entropy
                     
                     head_max = valid_weights.max().item()
