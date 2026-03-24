@@ -80,18 +80,22 @@ def analyze_attention_for_layer(
     layer_name: str,
     query: torch.Tensor,
     key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: "FlashAttentionMetadata",
     num_kv_heads: int,
     scale: float,
     causal: bool = True,
 ) -> dict:
-    """分析单层注意力权重分布 (内存优化版本)
+    """分析单层注意力权重分布 (支持 prefill 和 decode)
     
     通过分批处理避免创建完整的注意力矩阵，减少显存占用。
     
     Args:
         layer_name: 层名称
-        query: [num_tokens, num_heads, head_dim]
-        key: [num_tokens, num_kv_heads, head_dim]
+        query: [num_tokens, num_heads, head_dim] 当前 query tokens
+        key: [num_tokens, num_kv_heads, head_dim] 当前 key tokens (仅新产生的)
+        kv_cache: [2, num_blocks, block_size, num_kv_heads, head_size] KV cache
+        attn_metadata: 注意力元数据
         num_kv_heads: KV头数
         scale: 缩放因子
         causal: 是否因果注意力
@@ -110,17 +114,19 @@ def analyze_attention_for_layer(
     _ATTENTION_LAYER_COUNTER[layer_name] += 1
     
     with torch.no_grad():
-        num_tokens = query.shape[0]
+        num_query_tokens = query.shape[0]
         num_heads = query.shape[1]
         head_dim = query.shape[2]
         
         query_t = query.transpose(0, 1).float()
-        key_t = key.transpose(0, 1).float()
         
-        num_groups = num_heads // num_kv_heads
-        if num_groups > 1:
-            key_t = key_t.unsqueeze(1).expand(-1, num_groups, -1, -1)
-            key_t = key_t.reshape(num_heads, num_tokens, head_dim)
+        key_cache, _ = kv_cache.unbind(0)
+        
+        seq_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_table
+        query_start_loc = attn_metadata.query_start_loc
+        max_seq_len = attn_metadata.max_seq_len
+        block_size = key_cache.shape[2]
         
         total_near_zero_count = 0
         total_valid_elements = 0
@@ -129,50 +135,84 @@ def analyze_attention_for_layer(
         global_max_weight = 0.0
         global_min_weight = float('inf')
         global_sum_weight = 0.0
+        total_seq_len = 0
         
-        for h in range(num_heads):
-            q_h = query_t[h:h+1]
-            k_h = key_t[h:h+1]
+        num_seqs = query_start_loc.shape[0] - 1
+        
+        for seq_idx in range(num_seqs):
+            q_start = query_start_loc[seq_idx].item()
+            q_end = query_start_loc[seq_idx + 1].item()
+            num_q_tokens = q_end - q_start
             
-            attn_scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale
+            seq_len = seq_lens[seq_idx].item()
+            total_seq_len += seq_len
             
-            if causal and num_tokens > 1:
-                causal_mask = torch.triu(
-                    torch.ones(num_tokens, num_tokens, device=attn_scores.device),
-                    diagonal=1
-                ).bool()
-                attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+            seq_block_table = block_table[seq_idx]
             
-            attn_weights = F.softmax(attn_scores, dim=-1)
+            num_blocks = (seq_len + block_size - 1) // block_size
+            blocks_to_gather = seq_block_table[:num_blocks]
             
-            near_zero_mask = attn_weights < _ATTENTION_ANALYSIS_THRESHOLD
-            near_zero_count = near_zero_mask.sum().item()
-            total_near_zero_count += near_zero_count
+            full_key = key_cache[blocks_to_gather].flatten(0, 1)[:seq_len]
+            full_key = full_key.float()
             
-            head_total = attn_weights.numel()
-            total_valid_elements += head_total
-            head_near_zero_ratios.append(near_zero_count / head_total)
+            seq_query = query_t[:, q_start:q_end, :]
             
-            valid_weights = attn_weights[attn_weights > 0]
-            if valid_weights.numel() > 0:
-                head_entropy = -torch.sum(valid_weights * torch.log(valid_weights + 1e-10)).item()
-                total_entropy += head_entropy
+            num_groups = num_heads // num_kv_heads
+            if num_groups > 1:
+                full_key_expanded = full_key.unsqueeze(1).expand(-1, num_groups, -1, -1)
+                full_key_expanded = full_key_expanded.reshape(num_heads, seq_len, head_dim)
+            else:
+                full_key_expanded = full_key
+            
+            for h in range(num_heads):
+                q_h = seq_query[h:h+1]
+                k_h = full_key_expanded[h:h+1]
                 
-                head_max = valid_weights.max().item()
-                head_min = valid_weights.min().item()
-                global_max_weight = max(global_max_weight, head_max)
-                global_min_weight = min(global_min_weight, head_min)
-                global_sum_weight += attn_weights.sum().item()
+                attn_scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale
+                
+                if causal and seq_len > 1:
+                    for q_pos in range(num_q_tokens):
+                        q_token_idx = seq_len - num_q_tokens + q_pos
+                        causal_mask = torch.zeros(
+                            1, seq_len, device=attn_scores.device
+                        )
+                        causal_mask[q_pos, q_token_idx+1:] = float('-inf')
+                        attn_scores[q_pos:q_pos+1] = attn_scores[q_pos:q_pos+1] + causal_mask
+                
+                attn_weights = F.softmax(attn_scores, dim=-1)
+                
+                near_zero_mask = attn_weights < _ATTENTION_ANALYSIS_THRESHOLD
+                near_zero_count = near_zero_mask.sum().item()
+                total_near_zero_count += near_zero_count
+                
+                head_total = attn_weights.numel()
+                total_valid_elements += head_total
+                head_near_zero_ratios.append(near_zero_count / head_total)
+                
+                valid_weights = attn_weights[attn_weights > 0]
+                if valid_weights.numel() > 0:
+                    head_entropy = -torch.sum(valid_weights * torch.log(valid_weights + 1e-10)).item()
+                    total_entropy += head_entropy
+                    
+                    head_max = valid_weights.max().item()
+                    head_min = valid_weights.min().item()
+                    global_max_weight = max(global_max_weight, head_max)
+                    global_min_weight = min(global_min_weight, head_min)
+                    global_sum_weight += attn_weights.sum().item()
+                
+                del attn_weights, attn_scores, near_zero_mask
             
-            del attn_weights, attn_scores, near_zero_mask
+            del full_key, full_key_expanded, seq_query
         
         near_zero_ratio = total_near_zero_count / total_valid_elements if total_valid_elements > 0 else 0.0
-        avg_entropy = total_entropy / num_heads if num_heads > 0 else 0.0
+        avg_entropy = total_entropy / (num_heads * num_seqs) if num_seqs > 0 and num_heads > 0 else 0.0
         mean_weight = global_sum_weight / total_valid_elements if total_valid_elements > 0 else 0.0
         
         stats = {
             "layer_name": layer_name,
-            "num_tokens": num_tokens,
+            "num_query_tokens": num_query_tokens,
+            "total_seq_len": total_seq_len,
+            "num_seqs": num_seqs,
             "num_heads": num_heads,
             "total_elements": total_valid_elements,
             "near_zero_count": total_near_zero_count,
@@ -187,13 +227,15 @@ def analyze_attention_for_layer(
         _ATTENTION_LAYER_STATS[layer_name].append(stats)
         
         print(f"\n[AttentionAnalysis] {layer_name}:")
-        print(f"  Tokens: {num_tokens}, Heads: {num_heads}")
+        print(f"  Query tokens: {num_query_tokens}, Total seq len: {total_seq_len}, Seqs: {num_seqs}")
+        print(f"  Heads: {num_heads}")
         print(f"  接近零 (<{_ATTENTION_ANALYSIS_THRESHOLD}) 比例: {near_zero_ratio:.2%}")
         print(f"  接近零元素数: {total_near_zero_count:,} / {total_valid_elements:,}")
         print(f"  权重范围: [{stats['min_weight']:.6f}, {stats['max_weight']:.6f}]")
         print(f"  权重均值: {mean_weight:.6f}")
         print(f"  注意力熵: {avg_entropy:.4f}")
-        print(f"  各头接近零比例: min={min(head_near_zero_ratios):.2%}, max={max(head_near_zero_ratios):.2%}")
+        if head_near_zero_ratios:
+            print(f"  各头接近零比例: min={min(head_near_zero_ratios):.2%}, max={max(head_near_zero_ratios):.2%}")
         
         return stats
 
@@ -849,6 +891,8 @@ class FlashAttentionImpl(AttentionImpl):
                 layer_name=layer_name,
                 query=query[:num_actual_tokens],
                 key=key[:num_actual_tokens],
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
                 num_kv_heads=self.num_kv_heads,
                 scale=self.scale,
                 causal=attn_metadata.causal,
