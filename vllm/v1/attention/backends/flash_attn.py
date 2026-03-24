@@ -84,7 +84,9 @@ def analyze_attention_for_layer(
     scale: float,
     causal: bool = True,
 ) -> dict:
-    """分析单层注意力权重分布
+    """分析单层注意力权重分布 (内存优化版本)
+    
+    通过分批处理避免创建完整的注意力矩阵，减少显存占用。
     
     Args:
         layer_name: 层名称
@@ -120,45 +122,66 @@ def analyze_attention_for_layer(
             key_t = key_t.unsqueeze(1).expand(-1, num_groups, -1, -1)
             key_t = key_t.reshape(num_heads, num_tokens, head_dim)
         
-        attn_weights = torch.matmul(query_t, key_t.transpose(-2, -1)) * scale
-        
-        if causal and num_tokens > 1:
-            causal_mask = torch.triu(
-                torch.ones(num_tokens, num_tokens, device=attn_weights.device),
-                diagonal=1
-            ).bool()
-            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-        
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        
-        total_elements = attn_weights.numel()
-        near_zero_mask = attn_weights < _ATTENTION_ANALYSIS_THRESHOLD
-        near_zero_count = near_zero_mask.sum().item()
-        near_zero_ratio = near_zero_count / total_elements if total_elements > 0 else 0.0
-        
+        total_near_zero_count = 0
+        total_valid_elements = 0
         head_near_zero_ratios = []
-        for h in range(num_heads):
-            head_weights = attn_weights[h]
-            head_near_zero = (head_weights < _ATTENTION_ANALYSIS_THRESHOLD).sum().item()
-            head_total = head_weights.numel()
-            head_near_zero_ratios.append(head_near_zero / head_total)
+        total_entropy = 0.0
+        global_max_weight = 0.0
+        global_min_weight = float('inf')
+        global_sum_weight = 0.0
         
-        valid_weights = attn_weights[attn_weights > 0]
-        entropy = 0.0
-        if valid_weights.numel() > 0:
-            entropy = -torch.sum(valid_weights * torch.log(valid_weights + 1e-10)).item() / num_heads
+        for h in range(num_heads):
+            q_h = query_t[h:h+1]
+            k_h = key_t[h:h+1]
+            
+            attn_scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale
+            
+            if causal and num_tokens > 1:
+                causal_mask = torch.triu(
+                    torch.ones(num_tokens, num_tokens, device=attn_scores.device),
+                    diagonal=1
+                ).bool()
+                attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+            
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            
+            near_zero_mask = attn_weights < _ATTENTION_ANALYSIS_THRESHOLD
+            near_zero_count = near_zero_mask.sum().item()
+            total_near_zero_count += near_zero_count
+            
+            head_total = attn_weights.numel()
+            total_valid_elements += head_total
+            head_near_zero_ratios.append(near_zero_count / head_total)
+            
+            valid_weights = attn_weights[attn_weights > 0]
+            if valid_weights.numel() > 0:
+                head_entropy = -torch.sum(valid_weights * torch.log(valid_weights + 1e-10)).item()
+                total_entropy += head_entropy
+                
+                head_max = valid_weights.max().item()
+                head_min = valid_weights.min().item()
+                global_max_weight = max(global_max_weight, head_max)
+                global_min_weight = min(global_min_weight, head_min)
+                global_sum_weight += attn_weights.sum().item()
+            
+            del attn_weights, attn_scores, near_zero_mask
+        
+        near_zero_ratio = total_near_zero_count / total_valid_elements if total_valid_elements > 0 else 0.0
+        avg_entropy = total_entropy / num_heads if num_heads > 0 else 0.0
+        mean_weight = global_sum_weight / total_valid_elements if total_valid_elements > 0 else 0.0
         
         stats = {
             "layer_name": layer_name,
             "num_tokens": num_tokens,
             "num_heads": num_heads,
-            "total_elements": total_elements,
-            "near_zero_count": near_zero_count,
+            "total_elements": total_valid_elements,
+            "near_zero_count": total_near_zero_count,
             "near_zero_ratio": near_zero_ratio,
             "head_near_zero_ratios": head_near_zero_ratios,
-            "entropy": entropy,
-            "max_weight": attn_weights.max().item(),
-            "mean_weight": attn_weights.mean().item(),
+            "entropy": avg_entropy,
+            "max_weight": global_max_weight if global_max_weight > 0 else 1.0,
+            "min_weight": global_min_weight if global_min_weight < float('inf') else 0.0,
+            "mean_weight": mean_weight,
         }
         
         _ATTENTION_LAYER_STATS[layer_name].append(stats)
@@ -166,10 +189,10 @@ def analyze_attention_for_layer(
         print(f"\n[AttentionAnalysis] {layer_name}:")
         print(f"  Tokens: {num_tokens}, Heads: {num_heads}")
         print(f"  接近零 (<{_ATTENTION_ANALYSIS_THRESHOLD}) 比例: {near_zero_ratio:.2%}")
-        print(f"  接近零元素数: {near_zero_count:,} / {total_elements:,}")
-        print(f"  权重范围: [{attn_weights[attn_weights > 0].min().item() if (attn_weights > 0).any() else 0:.6f}, {stats['max_weight']:.6f}]")
-        print(f"  权重均值: {stats['mean_weight']:.6f}")
-        print(f"  注意力熵: {entropy:.4f}")
+        print(f"  接近零元素数: {total_near_zero_count:,} / {total_valid_elements:,}")
+        print(f"  权重范围: [{stats['min_weight']:.6f}, {stats['max_weight']:.6f}]")
+        print(f"  权重均值: {mean_weight:.6f}")
+        print(f"  注意力熵: {avg_entropy:.4f}")
         print(f"  各头接近零比例: min={min(head_near_zero_ratios):.2%}, max={max(head_near_zero_ratios):.2%}")
         
         return stats
