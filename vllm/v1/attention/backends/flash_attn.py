@@ -119,6 +119,7 @@ def analyze_attention_for_layer(
         head_dim = query.shape[2]
         
         query_t = query.transpose(0, 1).float()
+        key_t = key.transpose(0, 1).float()
         
         key_cache, _ = kv_cache.unbind(0)
         
@@ -147,15 +148,24 @@ def analyze_attention_for_layer(
             seq_len = seq_lens[seq_idx].item()
             total_seq_len += seq_len
             
-            seq_block_table = block_table[seq_idx]
-            
-            num_blocks = (seq_len + block_size - 1) // block_size
-            blocks_to_gather = seq_block_table[:num_blocks]
-            
-            full_key = key_cache[blocks_to_gather].flatten(0, 1)[:seq_len]
-            full_key = full_key.float()
-            
             seq_query = query_t[:, q_start:q_end, :]
+            seq_key = key_t[:, q_start:q_end, :]
+            
+            is_prefill = (num_q_tokens == seq_len)
+            
+            if is_prefill:
+                full_key = seq_key
+            else:
+                seq_block_table = block_table[seq_idx]
+                history_len = seq_len - num_q_tokens
+                num_blocks = (history_len + block_size - 1) // block_size
+                blocks_to_gather = seq_block_table[:num_blocks]
+                if history_len > 0:
+                    history_key = key_cache[blocks_to_gather].flatten(0, 1)[:history_len]
+                    history_key = history_key.transpose(0, 1).float()
+                    full_key = torch.cat([history_key, seq_key], dim=1)
+                else:
+                    full_key = seq_key
             
             num_groups = num_heads // num_kv_heads
             if num_groups > 1:
