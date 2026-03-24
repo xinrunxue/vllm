@@ -54,7 +54,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-_ATTENTION_ANALYSIS_ENABLED = False
+_ATTENTION_ANALYSIS_ENABLED = True
 _ATTENTION_ANALYSIS_THRESHOLD = 1e-4
 _ATTENTION_LAYER_COUNTER: dict[str, int] = {}
 _ATTENTION_LAYER_STATS: dict[str, list] = {}
@@ -170,14 +170,15 @@ def analyze_attention_for_layer(
                 
                 attn_scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale
                 
-                if causal and seq_len > 1:
+                if causal:
+                    causal_mask = torch.full(
+                        (num_q_tokens, seq_len), float('-inf'), 
+                        device=attn_scores.device
+                    )
                     for q_pos in range(num_q_tokens):
                         q_token_idx = seq_len - num_q_tokens + q_pos
-                        causal_mask = torch.zeros(
-                            1, seq_len, device=attn_scores.device
-                        )
-                        causal_mask[q_pos, q_token_idx+1:] = float('-inf')
-                        attn_scores[q_pos:q_pos+1] = attn_scores[q_pos:q_pos+1] + causal_mask
+                        causal_mask[q_pos, :q_token_idx+1] = 0.0
+                    attn_scores = attn_scores + causal_mask
                 
                 attn_weights = F.softmax(attn_scores, dim=-1)
                 
